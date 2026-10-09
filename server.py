@@ -646,7 +646,6 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
     if to_sq not in legal_moves:
         raise HTTPException(status_code=400, detail="Нелегальный ход")
 
-    # Авто-превращение белой пешки на 0-й горизонтали
     piece = session.board.grid[from_sq[0], from_sq[1]]
     promo = req.promo
     if piece and piece == ('W', 'P') and to_sq[0] == 0:
@@ -702,64 +701,94 @@ def index():
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Классические Шахматы с ИИ Luca!</title>
     <style>
+        * {
+            box-sizing: border-box;
+            touch-action: manipulation;
+        }
         body {
             background-color: #181a1e;
             color: #ffffff;
-            font-family: 'Consolas', monospace;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
             display: flex;
             flex-direction: column;
             align-items: center;
-            justify-content: center;
+            justify-content: flex-start;
             margin: 0;
-            padding: 10px;
+            padding: 12px;
+            min-height: 100vh;
         }
         #game-container {
             display: flex;
             flex-direction: column;
             align-items: center;
-            max-width: 500px;
             width: 100%;
+            max-width: 650px;
+        }
+        .canvas-wrapper {
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
         }
         canvas {
+            width: 100%;
+            height: 100%;
             border: 2px solid #373c46;
-            border-radius: 4px;
-            box-shadow: 0px 8px 20px rgba(0,0,0,0.6);
-            touch-action: none;
+            border-radius: 6px;
+            box-shadow: 0px 8px 25px rgba(0,0,0,0.7);
+            background-color: #f0d9b5;
         }
         .log-box {
             width: 100%;
             background-color: #14161a;
             border: 1px solid #373c46;
             border-radius: 8px;
-            padding: 10px;
-            box-sizing: border-box;
+            padding: 12px;
             margin-top: 15px;
-            height: 120px;
+            height: 150px;
             overflow-y: auto;
-            font-size: 13px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 14px;
+            box-shadow: inset 0 2px 6px rgba(0,0,0,0.5);
         }
-        .log-header { color: #f0c864; font-weight: bold; }
-        .log-dynamic { color: #b4dcf0; }
+        .log-item {
+            margin-bottom: 6px;
+            line-height: 1.5;
+            word-wrap: break-word;
+            display: block;
+        }
+        .log-header {
+            color: #f0c864;
+            font-weight: bold;
+        }
+        .log-dynamic {
+            color: #b4dcf0;
+        }
         .controls {
             display: flex;
             width: 100%;
             justify-content: space-between;
             margin-top: 15px;
-            gap: 10px;
+            gap: 12px;
         }
         button {
             flex: 1;
-            padding: 12px;
+            padding: 14px 20px;
             border: none;
             border-radius: 8px;
             font-weight: bold;
-            font-size: 14px;
+            font-size: 15px;
             cursor: pointer;
             color: white;
-            transition: 0.2s;
+            transition: background-color 0.2s, transform 0.1s;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+        }
+        button:active {
+            transform: scale(0.98);
         }
         .btn-reset { background-color: #2980b9; }
         .btn-reset:hover { background-color: #3498db; }
@@ -769,10 +798,12 @@ def index():
 </head>
 <body>
     <div id="game-container">
-        <canvas id="chessBoard" width="480" height="480"></canvas>
+        <div class="canvas-wrapper">
+            <canvas id="chessBoard" width="800" height="800"></canvas>
+        </div>
         <div class="log-box" id="logBox">
-            <div class="log-header">Шахматы с ИИ Luca! Запущены.</div>
-            <div class="log-header" id="keyCountLog">Загрузка базы...</div>
+            <div class="log-item log-header">Шахматы с ИИ Luca! Запущены.</div>
+            <div class="log-item log-header" id="keyCountLog">Загрузка базы...</div>
         </div>
         <div class="controls">
             <button class="btn-reset" onclick="startGame()">Перезапуск</button>
@@ -786,8 +817,8 @@ def index():
         const logBox = document.getElementById('logBox');
         const keyCountLog = document.getElementById('keyCountLog');
 
-        const SIZE = 480;
-        const SQ = SIZE / 8;
+        const BOARD_SIZE = 800;
+        const SQ = BOARD_SIZE / 8;
         let sessionId = null;
         let grid = [];
         let selectedSq = null;
@@ -800,14 +831,14 @@ def index():
 
         function addLog(text, isHeader=false) {
             const div = document.createElement('div');
-            div.className = isHeader ? 'log-header' : 'log-dynamic';
+            div.className = isHeader ? 'log-item log-header' : 'log-item log-dynamic';
             div.innerText = text;
             logBox.appendChild(div);
             logBox.scrollTop = logBox.scrollHeight;
         }
 
         async function startGame() {
-            logBox.innerHTML = '<div class="log-header">Шахматы с ИИ Luca! Запущены.</div>';
+            logBox.innerHTML = '<div class="log-item log-header">Шахматы с ИИ Luca! Запущены.</div>';
             const res = await fetch('/api/start', { method: 'POST' });
             const data = await res.json();
             sessionId = data.session_id;
@@ -822,7 +853,7 @@ def index():
         }
 
         function drawBoard() {
-            ctx.clearRect(0, 0, SIZE, SIZE);
+            ctx.clearRect(0, 0, BOARD_SIZE, BOARD_SIZE);
             for (let r = 0; r < 8; r++) {
                 for (let c = 0; c < 8; c++) {
                     const isLight = (r + c) % 2 === 0;
@@ -830,31 +861,31 @@ def index():
                     ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
 
                     if (lastMove && ((lastMove.from[0] === r && lastMove.from[1] === c) || (lastMove.to[0] === r && lastMove.to[1] === c))) {
-                        ctx.fillStyle = 'rgba(205, 210, 106, 0.6)';
+                        ctx.fillStyle = 'rgba(205, 210, 106, 0.65)';
                         ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
                     }
 
                     if (selectedSq && selectedSq[0] === r && selectedSq[1] === c) {
-                        ctx.fillStyle = 'rgba(186, 202, 68, 0.7)';
+                        ctx.fillStyle = 'rgba(186, 202, 68, 0.75)';
                         ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
                     }
 
                     if (legalMoves.some(m => m[0] === r && m[1] === c)) {
                         ctx.beginPath();
                         ctx.arc(c * SQ + SQ / 2, r * SQ + SQ / 2, SQ * 0.18, 0, 2 * Math.PI);
-                        ctx.fillStyle = 'rgba(40, 160, 60, 0.8)';
+                        ctx.fillStyle = 'rgba(40, 160, 60, 0.85)';
                         ctx.fill();
                     }
 
                     const piece = grid[r][c];
                     if (piece) {
                         const [color, type] = piece;
-                        ctx.font = `${SQ * 0.75}px Arial`;
+                        ctx.font = `bold ${SQ * 0.72}px Arial`;
                         ctx.textAlign = 'center';
                         ctx.textBaseline = 'middle';
                         ctx.fillStyle = color === 'W' ? '#ffffff' : '#1e1e23';
                         ctx.strokeStyle = color === 'W' ? '#1e1e23' : '#ffffff';
-                        ctx.lineWidth = 1.5;
+                        ctx.lineWidth = 2.5;
                         
                         const x = c * SQ + SQ / 2;
                         const y = r * SQ + SQ / 2;
@@ -865,10 +896,19 @@ def index():
             }
         }
 
-        canvas.addEventListener('click', async (e) => {
+        async function handleBoardInteraction(e) {
+            e.preventDefault();
             const rect = canvas.getBoundingClientRect();
-            const c = Math.floor((e.clientX - rect.left) / SQ);
-            const r = Math.floor((e.clientY - rect.top) / SQ);
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            
+            const scaleX = BOARD_SIZE / rect.width;
+            const scaleY = BOARD_SIZE / rect.height;
+            
+            const c = Math.floor(((clientX - rect.left) * scaleX) / SQ);
+            const r = Math.floor(((clientY - rect.top) * scaleY) / SQ);
+
+            if (r < 0 || r >= 8 || c < 0 || c >= 8) return;
 
             if (selectedSq) {
                 const [fr, fc] = selectedSq;
@@ -933,7 +973,9 @@ def index():
                 legalMoves = [];
             }
             drawBoard();
-        });
+        }
+
+        canvas.addEventListener('click', handleBoardInteraction);
 
         async function applyPenalty() {
             if (!sessionId) return;
