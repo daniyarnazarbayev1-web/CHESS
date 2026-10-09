@@ -4,12 +4,12 @@ import json
 import math
 import random
 import requests
-import asyncio
-from typing import Dict, Optional, Tuple, List
 import numpy as np
+from typing import Dict, Optional, Tuple, List
 from scipy.sparse import csr_matrix
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 # ==================== КОНФИГУРАЦИЯ TELEGRAM ====================
@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТ
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ТВОЙ_CHAT_ID")
 
 def send_telegram_report(message: str):
-    """Отправка отчета в Telegram в фоновом режиме"""
+    """Отправка аналитического отчета в Telegram в фоновом режиме"""
     if TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА" or not TELEGRAM_BOT_TOKEN:
         print("[Telegram Bot] Токен не настроен. Пропуск отправки.")
         return
@@ -207,10 +207,9 @@ class MatrixAssociationEngine:
             return self.verdicts_list[best_idx], best_score
         return None, 0.0
 
-# Глобальный движок для всех сессий
 global_engine = MatrixAssociationEngine("chess_associative_db.json")
 
-# ==================== ШАХМАТНАЯ ЛОГИКА СЕССИИ ====================
+# ==================== ШАХМАТНЫЙ ДВИЖОК СЕССИИ ====================
 PIECE_VALUES = {'P': 100, 'N': 320, 'B': 330, 'R': 500, 'Q': 900, 'K': 20000}
 
 class Board8x8:
@@ -448,7 +447,7 @@ class Board8x8:
                     else: val -= total
         return val
 
-# ==================== СЕССИЯ ИГРЫ С ИИ ====================
+# ==================== ИГРОВАЯ СЕССИЯ ИИ ====================
 class GameSession:
     def __init__(self, session_id: str):
         self.session_id = session_id
@@ -458,15 +457,16 @@ class GameSession:
         self.last_ai_move_info = None
         self.total_moves_count = 0
         self.new_keys_added = 0
-        self.initial_keys = len(global_engine.db)
 
-    def self_evaluate_and_punish(self):
+    def self_evaluate_and_punish(self) -> Optional[str]:
         if self.last_ai_move_info and self.ai_eval_before_last_move is not None:
             current_eval = -self.board.evaluate()
             if current_eval < self.ai_eval_before_last_move - 80.0:
                 key, move_str = self.last_ai_move_info
                 self.bad_moves_memory.add((key, move_str))
                 global_engine.remove_association(key)
+                return "🧠 ИИ: Мой прошлый ход был плохим! Запомнил не делать так."
+        return None
 
     def simulate_player_counter_move(self, hypothetical_key: str):
         player_verdict, p_score = global_engine.resolve(hypothetical_key)
@@ -495,14 +495,14 @@ class GameSession:
         self.board.turn = 'B'
         return best_p_dest, best_p_gain
 
-    def make_ai_move(self) -> Optional[Tuple[Tuple[int, int], Tuple[int, int], Optional[str]]]:
-        if self.board.turn != 'B': return None
-        self.self_evaluate_and_punish()
+    def make_ai_move(self) -> Tuple[Optional[Dict], Optional[str]]:
+        if self.board.turn != 'B': return None, None
+        punish_log = self.self_evaluate_and_punish()
         self.ai_eval_before_last_move = -self.board.evaluate()
 
         board_key = self.board.board_to_key()
         all_legal = self.board.get_all_legal_moves()
-        if not all_legal: return None
+        if not all_legal: return None, punish_log
 
         verdict_move_str, primary_score = global_engine.resolve(board_key)
         best_move = None
@@ -542,13 +542,35 @@ class GameSession:
                 self.new_keys_added += 1
             global_engine.add_association(board_key, m_str)
 
+            conf_pct = round(primary_score * 100, 1)
+            if primary_score > 0.35 and verdict_move_str:
+                log_txt = f"🧠 ИИ: {from_sq[0]}_{from_sq[1]}->{to_sq[0]}_{to_sq[1]} ({conf_pct}%)"
+            else:
+                log_txt = f"🤖 ИИ: {from_sq[0]}_{from_sq[1]}->{to_sq[0]}_{to_sq[1]} (Анализ выгоды)"
+
             promo = 'Q' if self.board.grid[from_sq[0], from_sq[1]][1] == 'P' and to_sq[0] == 7 else None
             self.board.push_move(from_sq, to_sq, promo=promo)
             self.total_moves_count += 1
-            return (from_sq, to_sq, promo)
-        return None
+            
+            ai_data = {
+                "from": [from_sq[0], from_sq[1]],
+                "to": [to_sq[0], to_sq[1]],
+                "promo": promo
+            }
+            return ai_data, log_txt
 
-# ==================== FASTAPI СЕРВЕР ====================
+        return None, punish_log
+
+    def apply_penalty((self)) -> str:
+        if not self.last_ai_move_info:
+            return "⚠️ Нет хода ИИ для штрафа!"
+        key, move_str = self.last_ai_move_info
+        self.bad_moves_memory.add((key, move_str))
+        global_engine.remove_association(key)
+        self.last_ai_move_info = None
+        return "⛔ Штраф применен! Ход заблокирован."
+
+# ==================== FASTAPI И ВЕБ-ИНТЕРФЕЙС ====================
 app = FastAPI(title="Chess Luca AI Server")
 
 app.add_middleware(
@@ -567,22 +589,35 @@ class MoveRequest(BaseModel):
     to_sq: List[int]
     promo: Optional[str] = None
 
-class GameEndRequest(BaseModel):
+class PenaltyRequest(BaseModel):
     session_id: str
-    result: str  # "win", "loss", "draw"
 
 @app.get("/ping")
 def ping():
-    """Эндпоинт для UptimeRobot, чтобы Render не спал"""
     return {"status": "ok", "total_db_keys": len(global_engine.db)}
+
+@app.get("/api/download_db")
+def download_db():
+    if os.path.exists("chess_associative_db.json"):
+        return FileResponse("chess_associative_db.json", filename="chess_associative_db.json")
+    raise HTTPException(status_code=404, detail="Файл базы не найден")
 
 @app.post("/api/start")
 def start_game():
     session_id = f"game_{random.randint(100000, 999999)}"
     sessions[session_id] = GameSession(session_id)
+    
+    grid_serialized = []
+    for r in range(8):
+        row = []
+        for c in range(8):
+            p = sessions[session_id].board.grid[r, c]
+            row.append([p[0], p[1]] if p else None)
+        grid_serialized.append(row)
+
     return {
         "session_id": session_id,
-        "board_key": sessions[session_id].board.board_to_key(),
+        "grid": grid_serialized,
         "total_keys": len(global_engine.db)
     }
 
@@ -602,10 +637,8 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
     session.board.push_move(from_sq, to_sq, promo=req.promo)
     session.total_moves_count += 1
 
-    # Ход ИИ в ответ
-    ai_move = session.make_ai_move()
+    ai_data, ai_log = session.make_ai_move()
 
-    # Проверка окончания игры
     all_legal_player = session.board.get_all_legal_moves()
     game_over = len(all_legal_player) == 0
 
@@ -630,23 +663,252 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
     return {
         "grid": grid_serialized,
         "turn": session.board.turn,
-        "ai_move": ai_move,
+        "ai_move": ai_data,
+        "ai_log": ai_log,
         "game_over": game_over,
         "total_keys": len(global_engine.db)
     }
 
-@app.post("/api/end_game")
-def end_game(req: GameEndRequest, background_tasks: BackgroundTasks):
-    if req.session_id in sessions:
-        session = sessions[req.session_id]
-        report = (
-            f"📊 **Отчет о партии**\n"
-            f"• Сессия: `{req.session_id}`\n"
-            f"• Итог: `{req.result.upper()}`\n"
-            f"• Ходов: `{session.total_moves_count}`\n"
-            f"• Новых паттернов: `{session.new_keys_added}`\n"
-            f"🧠 База выращена до `{len(global_engine.db)}` ключей."
-        )
-        background_tasks.add_task(send_telegram_report, report)
-        del sessions[req.session_id]
-    return {"status": "reported"}
+@app.post("/api/penalty")
+def apply_penalty(req: PenaltyRequest):
+    if req.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    session = sessions[req.session_id]
+    msg = session.apply_penalty()
+    return {"message": msg, "total_keys": len(global_engine.db)}
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    """Полный интерфейс на HTML5/Canvas в стиле Pygame"""
+    return HTMLResponse(content="""
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Классические Шахматы с ИИ Luca!</title>
+    <style>
+        body {
+            background-color: #181a1e;
+            color: #ffffff;
+            font-family: 'Consolas', monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            margin: 0;
+            padding: 10px;
+        }
+        #game-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            max-width: 500px;
+            width: 100%;
+        }
+        canvas {
+            border: 2px solid #373c46;
+            border-radius: 4px;
+            box-shadow: 0px 8px 20px rgba(0,0,0,0.6);
+            touch-action: none;
+        }
+        .log-box {
+            width: 100%;
+            background-color: #14161a;
+            border: 1px solid #373c46;
+            border-radius: 8px;
+            padding: 10px;
+            box-sizing: border-box;
+            margin-top: 15px;
+            height: 120px;
+            overflow-y: auto;
+            font-size: 13px;
+        }
+        .log-header { color: #f0c864; font-weight: bold; }
+        .log-dynamic { color: #b4dcf0; }
+        .controls {
+            display: flex;
+            width: 100%;
+            justify-content: space-between;
+            margin-top: 15px;
+            gap: 10px;
+        }
+        button {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+            color: white;
+            transition: 0.2s;
+        }
+        .btn-reset { background-color: #2980b9; }
+        .btn-reset:hover { background-color: #3498db; }
+        .btn-penalty { background-color: #c0392b; }
+        .btn-penalty:hover { background-color: #e74c3c; }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <canvas id="chessBoard" width="480" height="480"></canvas>
+        <div class="log-box" id="logBox">
+            <div class="log-header">Шахматы с ИИ Luca! Запущены.</div>
+            <div class="log-header" id="keyCountLog">Загрузка базы...</div>
+        </div>
+        <div class="controls">
+            <button class="btn-reset" onclick="startGame()">Перезапуск</button>
+            <button class="btn-penalty" onclick="applyPenalty()">Штраф AI</button>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('chessBoard');
+        const ctx = canvas.getContext('2d');
+        const logBox = document.getElementById('logBox');
+        const keyCountLog = document.getElementById('keyCountLog');
+
+        const SIZE = 480;
+        const SQ = SIZE / 8;
+        let sessionId = null;
+        let grid = [];
+        let selectedSq = null;
+        let lastMove = null;
+
+        const PIECES = {
+            'P': '♟', 'N': '♞', 'B': '♝', 'R': '♜', 'Q': '♛', 'K': '♚'
+        };
+
+        function addLog(text, isHeader=false) {
+            const div = document.createElement('div');
+            div.className = isHeader ? 'log-header' : 'log-dynamic';
+            div.innerText = text;
+            logBox.appendChild(div);
+            logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        async function startGame() {
+            logBox.innerHTML = '<div class="log-header">Шахматы с ИИ Luca! Запущены.</div>';
+            const res = await fetch('/api/start', { method: 'POST' });
+            const data = await res.json();
+            sessionId = data.session_id;
+            grid = data.grid;
+            selectedSq = null;
+            lastMove = null;
+            keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
+            logBox.appendChild(keyCountLog);
+            addLog("--- Партия перезапущена ---");
+            drawBoard();
+        }
+
+        function drawBoard() {
+            ctx.clearRect(0, 0, SIZE, SIZE);
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    const isLight = (r + c) % 2 === 0;
+                    ctx.fillStyle = isLight ? '#f0d9b5' : '#b58863';
+                    ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
+
+                    if (lastMove && ((lastMove.from[0] === r && lastMove.from[1] === c) || (lastMove.to[0] === r && lastMove.to[1] === c))) {
+                        ctx.fillStyle = 'rgba(205, 210, 106, 0.6)';
+                        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
+                    }
+
+                    if (selectedSq && selectedSq[0] === r && selectedSq[1] === c) {
+                        ctx.fillStyle = 'rgba(186, 202, 68, 0.7)';
+                        ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
+                    }
+
+                    const piece = grid[r][c];
+                    if (piece) {
+                        const [color, type] = piece;
+                        ctx.font = `${SQ * 0.75}px Arial`;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillStyle = color === 'W' ? '#ffffff' : '#1e1e23';
+                        ctx.strokeStyle = color === 'W' ? '#1e1e23' : '#ffffff';
+                        ctx.lineWidth = 1.5;
+                        
+                        const x = c * SQ + SQ / 2;
+                        const y = r * SQ + SQ / 2;
+                        ctx.strokeText(PIECES[type], x, y);
+                        ctx.fillText(PIECES[type], x, y);
+                    }
+                }
+            }
+        }
+
+        canvas.addEventListener('click', async (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const c = Math.floor((e.clientX - rect.left) / SQ);
+            const r = Math.floor((e.clientY - rect.top) / SQ);
+
+            if (selectedSq) {
+                const [fr, fc] = selectedSq;
+                if (fr === r && fc === c) {
+                    selectedSq = null;
+                    drawBoard();
+                    return;
+                }
+
+                try {
+                    const res = await fetch('/api/player_move', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            session_id: sessionId,
+                            from_sq: [fr, fc],
+                            to_sq: [r, c]
+                        })
+                    });
+
+                    if (res.ok) {
+                        const data = await res.json();
+                        grid = data.grid;
+                        lastMove = { from: [fr, fc], to: [r, c] };
+                        addLog(`Игрок: ${fr}_${fc} -> ${r}_${c}`);
+
+                        if (data.ai_log) addLog(data.ai_log);
+                        if (data.ai_move) {
+                            lastMove = { from: data.ai_move.from, to: data.ai_move.to };
+                        }
+
+                        keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
+                        selectedSq = null;
+                        drawBoard();
+
+                        if (data.game_over) {
+                            alert("Партия завершена!");
+                        }
+                        return;
+                    }
+                } catch (err) {}
+            }
+
+            const piece = grid[r][c];
+            if (piece && piece[0] === 'W') {
+                selectedSq = [r, c];
+            } else {
+                selectedSq = null;
+            }
+            drawBoard();
+        });
+
+        async function applyPenalty() {
+            if (!sessionId) return;
+            const res = await fetch('/api/penalty', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId })
+            });
+            const data = await res.json();
+            addLog(data.message);
+            keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
+        }
+
+        startGame();
+    </script>
+</body>
+</html>
+    """)
