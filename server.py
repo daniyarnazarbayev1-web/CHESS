@@ -17,10 +17,9 @@ from pydantic import BaseModel
 # ==================== КОНФИГУРАЦИЯ TELEGRAM ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ТВОЙ_CHAT_ID")
-BACKUP_INTERVAL_MINUTES = 5  # Интервал автосохранения в Telegram (в минутах)
+BACKUP_INTERVAL_MINUTES = 5
 
 def send_telegram_report(message: str):
-    """Отправка текстового сообщения в Telegram"""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -30,8 +29,7 @@ def send_telegram_report(message: str):
     except Exception as e:
         print(f"[Telegram Report Error]: {e}")
 
-def send_telegram_db_file(db_path: str, caption: str = "💾 Резервная копия базы данных"):
-    """Отправка файла базы данных (.json) в Telegram"""
+def send_telegram_db_file(db_path: str, caption: str = "💾 Резервная копия базы знаний ИИ"):
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
         return False
     if not os.path.exists(db_path):
@@ -48,21 +46,17 @@ def send_telegram_db_file(db_path: str, caption: str = "💾 Резервная 
         return False
 
 def download_latest_db_from_telegram(db_path: str) -> bool:
-    """Скачивание последнего отправленного файла базы из Telegram при старте"""
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
         return False
     try:
-        # Получаем список последних сообщений / апдейтов бота
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-50"
         res = requests.get(url, timeout=10)
         if res.status_code != 200:
             return False
-        
         data = res.json()
         if not data.get("ok"):
             return False
 
-        # Ищем документ с именем файла базы в истории сообщений (начиная с самых свежих)
         latest_file_id = None
         for update in reversed(data.get("result", [])):
             msg = update.get("message") or update.get("channel_post")
@@ -74,10 +68,8 @@ def download_latest_db_from_telegram(db_path: str) -> bool:
                 break
 
         if not latest_file_id:
-            print("[Telegram DB Restore]: Последний файл базы в чате не найден. Будет создана новая база.")
             return False
 
-        # Запрашиваем путь к файлу на серверах Telegram
         file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={latest_file_id}"
         file_info_res = requests.get(file_info_url, timeout=10)
         if file_info_res.status_code != 200:
@@ -87,13 +79,12 @@ def download_latest_db_from_telegram(db_path: str) -> bool:
         if not file_path_in_tg:
             return False
 
-        # Скачиваем файл и восстанавливаем его локально
         download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path_in_tg}"
         dl_res = requests.get(download_url, timeout=15)
         if dl_res.status_code == 200 and len(dl_res.content) > 0:
             with open(db_path, "wb") as f:
                 f.write(dl_res.content)
-            print(f"[Telegram DB Restore]: База успешно восстановлена из Telegram! Размер: {len(dl_res.content)} байт")
+            print(f"[Telegram DB Restore]: Успешно скачали последнюю базу из ТГ!")
             return True
     except Exception as e:
         print(f"[Telegram DB Download Error]: {e}")
@@ -121,10 +112,7 @@ class MatrixAssociationEngine:
         self.load_db()
 
     def load_db(self):
-        # 1. Пробуем восстановить базу с серверов Telegram
         download_latest_db_from_telegram(self.db_path)
-
-        # 2. Загружаем локальный файл
         if os.path.exists(self.db_path):
             try:
                 with open(self.db_path, "r", encoding="utf-8") as f:
@@ -133,8 +121,7 @@ class MatrixAssociationEngine:
                         self.db = data
                     else:
                         self.db = {}
-            except Exception as e:
-                print(f"[DB Load Error]: {e}")
+            except Exception:
                 self.db = {}
         else:
             self.db = {}
@@ -152,11 +139,6 @@ class MatrixAssociationEngine:
             os.replace(tmp_path, self.db_path)
         except Exception as e:
             print(f"[DB Save Error]: {e}")
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
 
     def tokenize(self, text: str) -> list[str]:
         text = text.lower()
@@ -543,6 +525,36 @@ class GameSession:
         self.last_ai_move_info = None
         self.total_moves_count = 0
         self.new_keys_added = 0
+        
+        # Цепочки истории игрока для связи Шага 1 -> Шага 3+
+        self.player_history_chain = []  # Хранит список туплов: (board_key, move_str, eval_before)
+
+    def learn_from_player_action(self, before_key: str, move_str: str, eval_before: float, eval_after: float, was_in_check: bool) -> Optional[str]:
+        """Учеба на ходах игрока: скопировать при пользе или спасении"""
+        player_gain = eval_after - eval_before
+        is_saving_move = was_in_check and not self.board.is_in_check('W')
+        
+        # 1. Запоминаем ход в цепочку для дальнейго анализа профита на Шаг 3+
+        self.player_history_chain.append((before_key, move_str, eval_before))
+
+        # 2. Если ход дал прямую выгоду ИЛИ спас от шаха/атаки -> Копируем ход игрока в базу ИИ
+        if player_gain > 50.0 or is_saving_move:
+            global_engine.add_association(before_key, move_str)
+            self.new_keys_added += 1
+            return f"🎓 ИИ выучил ход игрока {'(Спасение)' if is_saving_move else '(Выгода)'}"
+
+        # 3. Анализ многоходовых связей: Ссылка от Шаг 1 к Шаг 3+
+        if len(self.player_history_chain) >= 2:
+            step1_key, step1_move, step1_eval = self.player_history_chain[0]
+            long_term_gain = eval_after - step1_eval
+            
+            # Если связка от 1-го шага привела к победе или профиту через несколько ходов
+            if long_term_gain > 120.0:
+                global_engine.add_association(step1_key, step1_move)
+                self.new_keys_added += 1
+                return f"🔗 ИИ связал цепочку: Шаг 1 привел к профиту на Шаге {len(self.player_history_chain)*2-1}+!"
+
+        return None
 
     def self_evaluate_and_punish(self) -> Optional[str]:
         if self.last_ai_move_info and self.ai_eval_before_last_move is not None:
@@ -658,7 +670,6 @@ class GameSession:
 
 # ==================== ФОНОВЫЙ ТАЙМЕР ДЛЯ АВТОСОХРАНЕНИЯ ====================
 async def periodic_telegram_backup_task():
-    """Каждые BACKUP_INTERVAL_MINUTES минут выгружает файл базы в Telegram"""
     while True:
         await asyncio.sleep(BACKUP_INTERVAL_MINUTES * 60)
         try:
@@ -673,15 +684,13 @@ async def periodic_telegram_backup_task():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запускаем фоновую задачу периодического бэкапа в Telegram
     backup_task = asyncio.create_task(periodic_telegram_backup_task())
     yield
-    # Отменяем фоновую задачу и делаем финальный бэкап при остановке сервера
     backup_task.cancel()
     global_engine.save_db()
     send_telegram_db_file(
         global_engine.db_path, 
-        caption=f"🚨 Сервер останавливается/перезагружается!\n• Финальный дамп базы (`{len(global_engine.db)}` ключей)"
+        caption=f"🚨 Сервер перезагружается!\n• Дамп базы (`{len(global_engine.db)}` ключей)"
     )
 
 app = FastAPI(title="Chess Luca AI Server", lifespan=lifespan)
@@ -759,6 +768,12 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
     if to_sq not in legal_moves:
         raise HTTPException(status_code=400, detail="Нелегальный ход")
 
+    # Считываем состояние до хода игрока
+    before_board_key = session.board.board_to_key()
+    eval_before_player = session.board.evaluate()
+    was_in_check = session.board.is_in_check('W')
+    move_str = f"{from_sq[0]}_{from_sq[1]}_{to_sq[0]}_{to_sq[1]}"
+
     piece = session.board.grid[from_sq[0], from_sq[1]]
     promo = req.promo
     if piece and piece == ('W', 'P') and to_sq[0] == 0:
@@ -766,6 +781,12 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
 
     session.board.push_move(from_sq, to_sq, promo=promo)
     session.total_moves_count += 1
+
+    # Состояния после хода игрока для анализа обучению
+    eval_after_player = session.board.evaluate()
+    learn_log = session.learn_from_player_action(
+        before_board_key, move_str, eval_before_player, eval_after_player, was_in_check
+    )
 
     ai_data, ai_log = session.make_ai_move()
 
@@ -781,7 +802,6 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
             f"• Всего ключей в базе: `{len(global_engine.db)}`"
         )
         background_tasks.add_task(send_telegram_report, report)
-        # Также отправляем файл с базой знаний сразу после игры
         background_tasks.add_task(
             send_telegram_db_file, 
             global_engine.db_path, 
@@ -796,11 +816,15 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
             row.append([p[0], p[1]] if p else None)
         grid_serialized.append(row)
 
+    combined_log = ai_log
+    if learn_log:
+        combined_log = f"{learn_log}\n{ai_log}" if ai_log else learn_log
+
     return {
         "grid": grid_serialized,
         "turn": session.board.turn,
         "ai_move": ai_data,
-        "ai_log": ai_log,
+        "ai_log": combined_log,
         "game_over": game_over,
         "total_keys": len(global_engine.db)
     }
