@@ -884,6 +884,7 @@ def index():
             border-radius: 6px;
             box-shadow: 0px 8px 25px rgba(0,0,0,0.7);
             background-color: #f0d9b5;
+            touch-action: none;
         }
         .log-box {
             width: 100%;
@@ -956,21 +957,52 @@ def index():
 
     <script>
         const canvas = document.getElementById('chessBoard');
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
         const logBox = document.getElementById('logBox');
         const keyCountLog = document.getElementById('keyCountLog');
 
-        const BOARD_SIZE = 800;
+        const BOARD_SIZE = 800; // логические координаты рисования (не меняются)
         const SQ = BOARD_SIZE / 8;
+
         let sessionId = null;
         let grid = [];
         let selectedSq = null;
         let legalMoves = [];
         let lastMove = null;
+        let awaitingResponse = false;
+        let legalMovesAbortCtrl = null;
 
         const PIECES = {
             'P': '♟', 'N': '♞', 'B': '♝', 'R': '♜', 'Q': '♛', 'K': '♚'
         };
+
+        // ---------- Чёткость на любых экранах без потери FPS ----------
+        function fitCanvasToScreen() {
+            const dpr = Math.min(window.devicePixelRatio || 1, 2); // кап в 2x ради стабильного FPS
+            canvas.width = BOARD_SIZE * dpr;
+            canvas.height = BOARD_SIZE * dpr;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+        }
+        fitCanvasToScreen();
+        window.addEventListener('resize', fitCanvasToScreen);
+
+        // ---------- Плавные анимации ходов ----------
+        let activeAnimations = [];
+
+        function addAnimation(from, to, piece, duration, autoRemove) {
+            const anim = { from, to, piece, start: performance.now(), duration, autoRemove };
+            activeAnimations.push(anim);
+            return anim;
+        }
+
+        function removeAnimation(anim) {
+            const idx = activeAnimations.indexOf(anim);
+            if (idx >= 0) activeAnimations.splice(idx, 1);
+        }
+
+        function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
 
         function addLog(text, isHeader=false) {
             const div = document.createElement('div');
@@ -982,6 +1014,8 @@ def index():
 
         async function startGame() {
             logBox.innerHTML = '<div class="log-item log-header">Шахматы с ИИ Luca! Запущены.</div>';
+            activeAnimations = [];
+            awaitingResponse = false;
             const res = await fetch('/api/start', { method: 'POST' });
             const data = await res.json();
             sessionId = data.session_id;
@@ -992,11 +1026,23 @@ def index():
             keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
             logBox.appendChild(keyCountLog);
             addLog("--- Партия перезапущена ---");
-            drawBoard();
+        }
+
+        function drawPieceAt(colIdx, rowIdx, piece) {
+            const [color, type] = piece;
+            const x = colIdx * SQ + SQ / 2;
+            const y = rowIdx * SQ + SQ / 2;
+            ctx.font = `bold ${SQ * 0.72}px Arial`;
+            ctx.fillStyle = color === 'W' ? '#ffffff' : '#1e1e23';
+            ctx.strokeStyle = color === 'W' ? '#1e1e23' : '#ffffff';
+            ctx.lineWidth = 2.5;
+            ctx.strokeText(PIECES[type], x, y);
+            ctx.fillText(PIECES[type], x, y);
         }
 
         function drawBoard() {
             ctx.clearRect(0, 0, BOARD_SIZE, BOARD_SIZE);
+
             for (let r = 0; r < 8; r++) {
                 for (let c = 0; c < 8; c++) {
                     const isLight = (r + c) % 2 === 0;
@@ -1019,38 +1065,138 @@ def index():
                         ctx.fillStyle = 'rgba(40, 160, 60, 0.85)';
                         ctx.fill();
                     }
+                }
+            }
 
+            // Клетки, занятые анимацией, не рисуем статично (чтобы не дублировать фигуру)
+            let suppressed = null;
+            if (activeAnimations.length) {
+                suppressed = new Set();
+                for (const a of activeAnimations) {
+                    suppressed.add(a.from[0] + '_' + a.from[1]);
+                    suppressed.add(a.to[0] + '_' + a.to[1]);
+                }
+            }
+
+            for (let r = 0; r < 8; r++) {
+                for (let c = 0; c < 8; c++) {
+                    if (suppressed && suppressed.has(r + '_' + c)) continue;
                     const piece = grid[r][c];
-                    if (piece) {
-                        const [color, type] = piece;
-                        ctx.font = `bold ${SQ * 0.72}px Arial`;
-                        ctx.textAlign = 'center';
-                        ctx.textBaseline = 'middle';
-                        ctx.fillStyle = color === 'W' ? '#ffffff' : '#1e1e23';
-                        ctx.strokeStyle = color === 'W' ? '#1e1e23' : '#ffffff';
-                        ctx.lineWidth = 2.5;
-                        
-                        const x = c * SQ + SQ / 2;
-                        const y = r * SQ + SQ / 2;
-                        ctx.strokeText(PIECES[type], x, y);
-                        ctx.fillText(PIECES[type], x, y);
+                    if (piece) drawPieceAt(c, r, piece);
+                }
+            }
+
+            // Движущиеся фигуры — поверх всего
+            const now = performance.now();
+            for (const a of activeAnimations) {
+                const t = Math.min(1, (now - a.start) / a.duration);
+                const e = easeOutCubic(t);
+                const col = a.from[1] + (a.to[1] - a.from[1]) * e;
+                const row = a.from[0] + (a.to[0] - a.from[0]) * e;
+                drawPieceAt(col, row, a.piece);
+            }
+        }
+
+        // ---------- Главный рендер-цикл: стабильный высокий FPS на любых устройствах ----------
+        function renderLoop() {
+            const now = performance.now();
+            for (let i = activeAnimations.length - 1; i >= 0; i--) {
+                const a = activeAnimations[i];
+                if (a.autoRemove && (now - a.start) >= a.duration) {
+                    activeAnimations.splice(i, 1);
+                }
+            }
+            drawBoard();
+            requestAnimationFrame(renderLoop);
+        }
+        requestAnimationFrame(renderLoop);
+
+        function getSquareFromEvent(e) {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = BOARD_SIZE / rect.width;
+            const scaleY = BOARD_SIZE / rect.height;
+            const c = Math.floor(((e.clientX - rect.left) * scaleX) / SQ);
+            const r = Math.floor(((e.clientY - rect.top) * scaleY) / SQ);
+            return [r, c];
+        }
+
+        async function selectSquare(r, c) {
+            selectedSq = [r, c];
+            legalMoves = []; // выбор отображается мгновенно, точки подтянутся сразу по ответу
+
+            if (legalMovesAbortCtrl) legalMovesAbortCtrl.abort();
+            legalMovesAbortCtrl = new AbortController();
+
+            try {
+                const res = await fetch('/api/legal_moves', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, sq: [r, c] }),
+                    signal: legalMovesAbortCtrl.signal
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (selectedSq && selectedSq[0] === r && selectedSq[1] === c) {
+                        legalMoves = data.moves;
                     }
                 }
+            } catch (err) {
+                // запрос отменён новым выбором — это нормально
+            }
+        }
+
+        async function handlePlayerMove(fr, fc, r, c) {
+            awaitingResponse = true;
+            const piece = grid[fr][fc];
+
+            // Мгновенная плавная анимация хода игрока — не ждём сервер.
+            // Фигура долетает до клетки и "замирает" там до подтверждения ответа.
+            const playerAnim = addAnimation([fr, fc], [r, c], piece, 200, false);
+            lastMove = { from: [fr, fc], to: [r, c] };
+            addLog(`Игрок: ${fr}_${fc} -> ${r}_${c}`);
+            selectedSq = null;
+            legalMoves = [];
+
+            try {
+                const res = await fetch('/api/player_move', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, from_sq: [fr, fc], to_sq: [r, c] })
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    grid = data.grid;
+                    removeAnimation(playerAnim);
+
+                    if (data.ai_log) addLog(data.ai_log);
+
+                    if (data.ai_move) {
+                        const aiPiece = grid[data.ai_move.to[0]][data.ai_move.to[1]];
+                        addAnimation(data.ai_move.from, data.ai_move.to, aiPiece, 260, true);
+                        lastMove = { from: data.ai_move.from, to: data.ai_move.to };
+                    }
+
+                    keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
+
+                    if (data.game_over) {
+                        setTimeout(() => alert("Партия завершена!"), 300);
+                    }
+                } else {
+                    removeAnimation(playerAnim);
+                }
+            } catch (err) {
+                removeAnimation(playerAnim);
+            } finally {
+                awaitingResponse = false;
             }
         }
 
         async function handleBoardInteraction(e) {
             e.preventDefault();
-            const rect = canvas.getBoundingClientRect();
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-            
-            const scaleX = BOARD_SIZE / rect.width;
-            const scaleY = BOARD_SIZE / rect.height;
-            
-            const c = Math.floor(((clientX - rect.left) * scaleX) / SQ);
-            const r = Math.floor(((clientY - rect.top) * scaleY) / SQ);
+            if (awaitingResponse) return; // пока обрабатывается ход — не мешаем анимации/серверу
 
+            const [r, c] = getSquareFromEvent(e);
             if (r < 0 || r >= 8 || c < 0 || c >= 8) return;
 
             if (selectedSq) {
@@ -1058,67 +1204,25 @@ def index():
                 if (fr === r && fc === c) {
                     selectedSq = null;
                     legalMoves = [];
-                    drawBoard();
                     return;
                 }
 
                 if (legalMoves.some(m => m[0] === r && m[1] === c)) {
-                    try {
-                        const res = await fetch('/api/player_move', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                session_id: sessionId,
-                                from_sq: [fr, fc],
-                                to_sq: [r, c]
-                            })
-                        });
-
-                        if (res.ok) {
-                            const data = await res.json();
-                            grid = data.grid;
-                            lastMove = { from: [fr, fc], to: [r, c] };
-                            addLog(`Игрок: ${fr}_${fc} -> ${r}_${c}`);
-
-                            if (data.ai_log) addLog(data.ai_log);
-                            if (data.ai_move) {
-                                lastMove = { from: data.ai_move.from, to: data.ai_move.to };
-                            }
-
-                            keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
-                            selectedSq = null;
-                            legalMoves = [];
-                            drawBoard();
-
-                            if (data.game_over) {
-                                alert("Партия завершена!");
-                            }
-                            return;
-                        }
-                    } catch (err) {}
+                    handlePlayerMove(fr, fc, r, c);
+                    return;
                 }
             }
 
-            const piece = grid[r][c];
+            const piece = grid[r] ? grid[r][c] : null;
             if (piece && piece[0] === 'W') {
-                selectedSq = [r, c];
-                const res = await fetch('/api/legal_moves', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ session_id: sessionId, sq: [r, c] })
-                });
-                if (res.ok) {
-                    const data = await res.json();
-                    legalMoves = data.moves;
-                }
+                selectSquare(r, c);
             } else {
                 selectedSq = null;
                 legalMoves = [];
             }
-            drawBoard();
         }
 
-        canvas.addEventListener('click', handleBoardInteraction);
+        canvas.addEventListener('pointerdown', handleBoardInteraction);
 
         async function applyPenalty() {
             if (!sessionId) return;
