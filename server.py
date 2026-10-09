@@ -561,7 +561,7 @@ class GameSession:
 
         return None, punish_log
 
-    def apply_penalty((self)) -> str:
+    def apply_penalty(self) -> str:
         if not self.last_ai_move_info:
             return "⚠️ Нет хода ИИ для штрафа!"
         key, move_str = self.last_ai_move_info
@@ -588,6 +588,10 @@ class MoveRequest(BaseModel):
     from_sq: List[int]
     to_sq: List[int]
     promo: Optional[str] = None
+
+class LegalMovesRequest(BaseModel):
+    session_id: str
+    sq: List[int]
 
 class PenaltyRequest(BaseModel):
     session_id: str
@@ -621,6 +625,14 @@ def start_game():
         "total_keys": len(global_engine.db)
     }
 
+@app.post("/api/legal_moves")
+def get_legal_moves(req: LegalMovesRequest):
+    if req.session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Сессия не найдена")
+    session = sessions[req.session_id]
+    moves = session.board.get_legal_moves_for_sq(req.sq[0], req.sq[1])
+    return {"moves": [[m[0], m[1]] for m in moves]}
+
 @app.post("/api/player_move")
 def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
     if req.session_id not in sessions:
@@ -634,7 +646,13 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
     if to_sq not in legal_moves:
         raise HTTPException(status_code=400, detail="Нелегальный ход")
 
-    session.board.push_move(from_sq, to_sq, promo=req.promo)
+    # Авто-превращение белой пешки на 0-й горизонтали
+    piece = session.board.grid[from_sq[0], from_sq[1]]
+    promo = req.promo
+    if piece and piece == ('W', 'P') and to_sq[0] == 0:
+        promo = 'Q'
+
+    session.board.push_move(from_sq, to_sq, promo=promo)
     session.total_moves_count += 1
 
     ai_data, ai_log = session.make_ai_move()
@@ -679,7 +697,6 @@ def apply_penalty(req: PenaltyRequest):
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    """Полный интерфейс на HTML5/Canvas в стиле Pygame"""
     return HTMLResponse(content="""
 <!DOCTYPE html>
 <html lang="ru">
@@ -774,6 +791,7 @@ def index():
         let sessionId = null;
         let grid = [];
         let selectedSq = null;
+        let legalMoves = [];
         let lastMove = null;
 
         const PIECES = {
@@ -795,6 +813,7 @@ def index():
             sessionId = data.session_id;
             grid = data.grid;
             selectedSq = null;
+            legalMoves = [];
             lastMove = null;
             keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
             logBox.appendChild(keyCountLog);
@@ -818,6 +837,13 @@ def index():
                     if (selectedSq && selectedSq[0] === r && selectedSq[1] === c) {
                         ctx.fillStyle = 'rgba(186, 202, 68, 0.7)';
                         ctx.fillRect(c * SQ, r * SQ, SQ, SQ);
+                    }
+
+                    if (legalMoves.some(m => m[0] === r && m[1] === c)) {
+                        ctx.beginPath();
+                        ctx.arc(c * SQ + SQ / 2, r * SQ + SQ / 2, SQ * 0.18, 0, 2 * Math.PI);
+                        ctx.fillStyle = 'rgba(40, 160, 60, 0.8)';
+                        ctx.fill();
                     }
 
                     const piece = grid[r][c];
@@ -848,49 +874,63 @@ def index():
                 const [fr, fc] = selectedSq;
                 if (fr === r && fc === c) {
                     selectedSq = null;
+                    legalMoves = [];
                     drawBoard();
                     return;
                 }
 
-                try {
-                    const res = await fetch('/api/player_move', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            session_id: sessionId,
-                            from_sq: [fr, fc],
-                            to_sq: [r, c]
-                        })
-                    });
+                if (legalMoves.some(m => m[0] === r && m[1] === c)) {
+                    try {
+                        const res = await fetch('/api/player_move', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                session_id: sessionId,
+                                from_sq: [fr, fc],
+                                to_sq: [r, c]
+                            })
+                        });
 
-                    if (res.ok) {
-                        const data = await res.json();
-                        grid = data.grid;
-                        lastMove = { from: [fr, fc], to: [r, c] };
-                        addLog(`Игрок: ${fr}_${fc} -> ${r}_${c}`);
+                        if (res.ok) {
+                            const data = await res.json();
+                            grid = data.grid;
+                            lastMove = { from: [fr, fc], to: [r, c] };
+                            addLog(`Игрок: ${fr}_${fc} -> ${r}_${c}`);
 
-                        if (data.ai_log) addLog(data.ai_log);
-                        if (data.ai_move) {
-                            lastMove = { from: data.ai_move.from, to: data.ai_move.to };
+                            if (data.ai_log) addLog(data.ai_log);
+                            if (data.ai_move) {
+                                lastMove = { from: data.ai_move.from, to: data.ai_move.to };
+                            }
+
+                            keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
+                            selectedSq = null;
+                            legalMoves = [];
+                            drawBoard();
+
+                            if (data.game_over) {
+                                alert("Партия завершена!");
+                            }
+                            return;
                         }
-
-                        keyCountLog.innerText = `База загружена. Ключей: ${data.total_keys}`;
-                        selectedSq = null;
-                        drawBoard();
-
-                        if (data.game_over) {
-                            alert("Партия завершена!");
-                        }
-                        return;
-                    }
-                } catch (err) {}
+                    } catch (err) {}
+                }
             }
 
             const piece = grid[r][c];
             if (piece && piece[0] === 'W') {
                 selectedSq = [r, c];
+                const res = await fetch('/api/legal_moves', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sessionId, sq: [r, c] })
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    legalMoves = data.moves;
+                }
             } else {
                 selectedSq = null;
+                legalMoves = [];
             }
             drawBoard();
         });
