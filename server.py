@@ -3,9 +3,11 @@ import re
 import json
 import math
 import random
+import asyncio
 import requests
 import numpy as np
 from typing import Dict, Optional, Tuple, List
+from contextlib import asynccontextmanager
 from scipy.sparse import csr_matrix
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,22 +17,87 @@ from pydantic import BaseModel
 # ==================== КОНФИГУРАЦИЯ TELEGRAM ====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "ТВОЙ_ТОКЕН_БОТА")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "ТВОЙ_CHAT_ID")
+BACKUP_INTERVAL_MINUTES = 5  # Интервал автосохранения в Telegram (в минутах)
 
 def send_telegram_report(message: str):
-    """Отправка аналитического отчета в Telegram в фоновом режиме"""
-    if TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА" or not TELEGRAM_BOT_TOKEN:
-        print("[Telegram Bot] Токен не настроен. Пропуск отправки.")
+    """Отправка текстового сообщения в Telegram"""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"[Telegram Bot Error]: {e}")
+        print(f"[Telegram Report Error]: {e}")
+
+def send_telegram_db_file(db_path: str, caption: str = "💾 Резервная копия базы данных"):
+    """Отправка файла базы данных (.json) в Telegram"""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
+        return False
+    if not os.path.exists(db_path):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    try:
+        with open(db_path, "rb") as f:
+            files = {"document": (os.path.basename(db_path), f)}
+            data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
+            response = requests.post(url, data=data, files=files, timeout=15)
+            return response.status_code == 200
+    except Exception as e:
+        print(f"[Telegram File Send Error]: {e}")
+        return False
+
+def download_latest_db_from_telegram(db_path: str) -> bool:
+    """Скачивание последнего отправленного файла базы из Telegram при старте"""
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "ТВОЙ_ТОКЕН_БОТА":
+        return False
+    try:
+        # Получаем список последних сообщений / апдейтов бота
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset=-50"
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            return False
+        
+        data = res.json()
+        if not data.get("ok"):
+            return False
+
+        # Ищем документ с именем файла базы в истории сообщений (начиная с самых свежих)
+        latest_file_id = None
+        for update in reversed(data.get("result", [])):
+            msg = update.get("message") or update.get("channel_post")
+            if not msg:
+                continue
+            doc = msg.get("document")
+            if doc and doc.get("file_name") == os.path.basename(db_path):
+                latest_file_id = doc.get("file_id")
+                break
+
+        if not latest_file_id:
+            print("[Telegram DB Restore]: Последний файл базы в чате не найден. Будет создана новая база.")
+            return False
+
+        # Запрашиваем путь к файлу на серверах Telegram
+        file_info_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={latest_file_id}"
+        file_info_res = requests.get(file_info_url, timeout=10)
+        if file_info_res.status_code != 200:
+            return False
+
+        file_path_in_tg = file_info_res.json().get("result", {}).get("file_path")
+        if not file_path_in_tg:
+            return False
+
+        # Скачиваем файл и восстанавливаем его локально
+        download_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path_in_tg}"
+        dl_res = requests.get(download_url, timeout=15)
+        if dl_res.status_code == 200 and len(dl_res.content) > 0:
+            with open(db_path, "wb") as f:
+                f.write(dl_res.content)
+            print(f"[Telegram DB Restore]: База успешно восстановлена из Telegram! Размер: {len(dl_res.content)} байт")
+            return True
+    except Exception as e:
+        print(f"[Telegram DB Download Error]: {e}")
+    return False
 
 # ==================== МАТРИЧНЫЙ ДВИЖОК АССОЦИАЦИЙ ====================
 class MatrixAssociationEngine:
@@ -54,23 +121,42 @@ class MatrixAssociationEngine:
         self.load_db()
 
     def load_db(self):
-        try:
-            if os.path.exists(self.db_path):
+        # 1. Пробуем восстановить базу с серверов Telegram
+        download_latest_db_from_telegram(self.db_path)
+
+        # 2. Загружаем локальный файл
+        if os.path.exists(self.db_path):
+            try:
                 with open(self.db_path, "r", encoding="utf-8") as f:
-                    self.db = json.load(f)
-            else:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        self.db = data
+                    else:
+                        self.db = {}
+            except Exception as e:
+                print(f"[DB Load Error]: {e}")
                 self.db = {}
-            self._recalculate_cache()
-        except Exception:
+        else:
             self.db = {}
             self.save_db()
 
+        self._recalculate_cache()
+
     def save_db(self):
+        tmp_path = f"{self.db_path}.tmp"
         try:
-            with open(self.db_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.db, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.db_path)
         except Exception as e:
             print(f"[DB Save Error]: {e}")
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     def tokenize(self, text: str) -> list[str]:
         text = text.lower()
@@ -87,7 +173,6 @@ class MatrixAssociationEngine:
         doc_count = len(self.db)
         self.keys_list = list(self.db.keys())
         self.verdicts_list = [self.db[k] for k in self.keys_list]
-        self.dirty = False
         
         if doc_count == 0:
             self.words_matrix = csr_matrix((0, 0))
@@ -157,6 +242,7 @@ class MatrixAssociationEngine:
     def resolve(self, query: str):
         if self.dirty:
             self._recalculate_cache()
+            self.dirty = False
 
         if not self.db or self.words_matrix.shape[0] == 0:
             return None, 0.0
@@ -570,8 +656,35 @@ class GameSession:
         self.last_ai_move_info = None
         return "⛔ Штраф применен! Ход заблокирован."
 
+# ==================== ФОНОВЫЙ ТАЙМЕР ДЛЯ АВТОСОХРАНЕНИЯ ====================
+async def periodic_telegram_backup_task():
+    """Каждые BACKUP_INTERVAL_MINUTES минут выгружает файл базы в Telegram"""
+    while True:
+        await asyncio.sleep(BACKUP_INTERVAL_MINUTES * 60)
+        try:
+            global_engine.save_db()
+            total_keys = len(global_engine.db)
+            caption = f"⏱️ Автобэкап базы данных по таймеру!\n• Всего ключей: `{total_keys}`"
+            send_telegram_db_file(global_engine.db_path, caption=caption)
+        except Exception as e:
+            print(f"[Periodic Backup Error]: {e}")
+
 # ==================== FASTAPI И ВЕБ-ИНТЕРФЕЙС ====================
-app = FastAPI(title="Chess Luca AI Server")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Запускаем фоновую задачу периодического бэкапа в Telegram
+    backup_task = asyncio.create_task(periodic_telegram_backup_task())
+    yield
+    # Отменяем фоновую задачу и делаем финальный бэкап при остановке сервера
+    backup_task.cancel()
+    global_engine.save_db()
+    send_telegram_db_file(
+        global_engine.db_path, 
+        caption=f"🚨 Сервер останавливается/перезагружается!\n• Финальный дамп базы (`{len(global_engine.db)}` ключей)"
+    )
+
+app = FastAPI(title="Chess Luca AI Server", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -668,6 +781,12 @@ def player_move(req: MoveRequest, background_tasks: BackgroundTasks):
             f"• Всего ключей в базе: `{len(global_engine.db)}`"
         )
         background_tasks.add_task(send_telegram_report, report)
+        # Также отправляем файл с базой знаний сразу после игры
+        background_tasks.add_task(
+            send_telegram_db_file, 
+            global_engine.db_path, 
+            f"🏆 База данных после партии `{req.session_id}`"
+        )
 
     grid_serialized = []
     for r in range(8):
